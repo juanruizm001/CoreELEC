@@ -1,0 +1,239 @@
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index fa50dcb8543b160904f49362cafe245db00c355f..9da2f2379c704ac574d008260d1eac034ad0e30b 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -709,6 +709,11 @@ struct TCP_Server_Info {
+ 	 * session's original transport.
+ 	 */
+ 	struct TCP_Server_Info *primary_server;
++	/*
++	 * SMB3 ChannelSequence is primary/session scoped. Increment it whenever
++	 * any channel reconnects and use the primary value on all channels.
++	 */
++	__u16 channel_sequence_num;
+ #ifdef CONFIG_CIFS_SWN_UPCALL
+ 	bool use_swn_dstaddr;
+ 	struct sockaddr_storage swn_dstaddr;
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 8a289ef4f944073f1bebf0a487073c7fc4137383..bc57b276049498cd1b0f3fc1d561baccae8c43a9 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -1604,6 +1604,7 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx)
+ 		ctx->target_rfc1001_name, RFC1001_NAME_LEN_WITH_NULL);
+ 	tcp_ses->session_estab = false;
+ 	tcp_ses->sequence_number = 0;
++	tcp_ses->channel_sequence_num = 0;
+ 	tcp_ses->reconnect_instance = 1;
+ 	tcp_ses->lstrp = jiffies;
+ 	tcp_ses->compress_algorithm = cpu_to_le16(ctx->compression);
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 619905fc694e4b9729198c25ccd331ce13e8021c..94246935b0c4dd5d21b1c51f6fc4398fb7296a60 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -152,6 +152,7 @@ smb2_add_credits(struct TCP_Server_Info *server,
+ static void
+ smb2_set_credits(struct TCP_Server_Info *server, const int val)
+ {
++	struct TCP_Server_Info *pserver;
+ 	int scredits, in_flight;
+ 
+ 	spin_lock(&server->req_lock);
+@@ -162,6 +163,20 @@ smb2_set_credits(struct TCP_Server_Info *server, const int val)
+ 	in_flight = server->in_flight;
+ 	spin_unlock(&server->req_lock);
+ 
++	/*
++	 * ChannelSequence is shared by all channels of the SMB session.
++	 * Serialize the update on the primary transport's req_lock so parallel
++	 * channel reconnects cannot lose an increment.
++	 */
++	if (val == 1) {
++		pserver = server->is_channel ? server->primary_server : server;
++		if (pserver) {
++			spin_lock(&pserver->req_lock);
++			pserver->channel_sequence_num++;
++			spin_unlock(&pserver->req_lock);
++		}
++	}
++
+ 	trace_smb3_set_credits(server->CurrentMid,
+ 			server->conn_id, server->hostname, scredits, val, in_flight);
+ 	cifs_dbg(FYI, "%s: set %u credits\n", __func__, val);
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index ef8bd03979f54d629ad6372d4d2365e2d4274ccb..0e6208e1c833cf490c57b07a4d8f02ffccacb5fb 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -88,10 +88,31 @@ smb2_hdr_assemble(struct smb2_sync_hdr *shdr, __le16 smb2_cmd,
+ 		  const struct cifs_tcon *tcon,
+ 		  struct TCP_Server_Info *server)
+ {
++	struct TCP_Server_Info *pserver;
++	__u16 channel_sequence = 0;
++
+ 	shdr->ProtocolId = SMB2_PROTO_NUMBER;
+ 	shdr->StructureSize = cpu_to_le16(64);
+ 	shdr->Command = smb2_cmd;
++
++	/*
++	 * In responses bytes 8..11 are Status. For SMB3 requests the same four
++	 * bytes are ChannelSequence + Reserved. Keep Reserved zero and store the
++	 * primary-scoped sequence in the low 16 bits. Check server before
++	 * dereferencing dialect (upstream 05d0f8f55ad6 safety ordering).
++	 */
++	shdr->Status = 0;
+ 	if (server) {
++		if (server->dialect >= SMB30_PROT_ID) {
++			pserver = server->is_channel ? server->primary_server : server;
++			if (pserver) {
++				spin_lock(&pserver->req_lock);
++				channel_sequence = pserver->channel_sequence_num;
++				spin_unlock(&pserver->req_lock);
++				shdr->Status = cpu_to_le32((__u32)channel_sequence);
++			}
++		}
++
+ 		spin_lock(&server->req_lock);
+ 		/* Request up to 10 credits but don't go over the limit. */
+ 		if (server->credits >= server->max_credits)
+@@ -1809,10 +1830,7 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
+ 	__le16 *unc_path = NULL;
+ 	int flags = 0;
+ 	unsigned int total_len;
+-	struct TCP_Server_Info *server;
+-
+-	/* always use master channel */
+-	server = ses->server;
++	struct TCP_Server_Info *server = cifs_pick_channel(ses);
+ 
+ 	cifs_dbg(FYI, "TCON\n");
+ 
+@@ -1940,6 +1958,7 @@ SMB2_tdis(const unsigned int xid, struct cifs_tcon *tcon)
+ 	struct smb2_tree_disconnect_req *req; /* response is trivial */
+ 	int rc = 0;
+ 	struct cifs_ses *ses = tcon->ses;
++	struct TCP_Server_Info *server;
+ 	int flags = 0;
+ 	unsigned int total_len;
+ 	struct kvec iov[1];
+@@ -1954,9 +1973,13 @@ SMB2_tdis(const unsigned int xid, struct cifs_tcon *tcon)
+ 	if ((tcon->need_reconnect) || (tcon->ses->need_reconnect))
+ 		return 0;
+ 
++	server = cifs_pick_channel(ses);
++	if (!server)
++		return -EIO;
++
+ 	close_cached_dir_lease(&tcon->crfid);
+ 
+-	rc = smb2_plain_req_init(SMB2_TREE_DISCONNECT, tcon, ses->server,
++	rc = smb2_plain_req_init(SMB2_TREE_DISCONNECT, tcon, server,
+ 				 (void **) &req,
+ 				 &total_len);
+ 	if (rc)
+@@ -1974,7 +1997,7 @@ SMB2_tdis(const unsigned int xid, struct cifs_tcon *tcon)
+ 	rqst.rq_iov = iov;
+ 	rqst.rq_nvec = 1;
+ 
+-	rc = cifs_send_recv(xid, ses, ses->server,
++	rc = cifs_send_recv(xid, ses, server,
+ 			    &rqst, &resp_buf_type, flags, &rsp_iov);
+ 	cifs_small_buf_release(req);
+ 	if (rc)
+diff --git a/fs/cifs/transport.c b/fs/cifs/transport.c
+index 298417106c7cd5c03113bc28f490ee291c208161..03b46fa462fb3d4cb34e89506a06ffc2c37ff8e6 100644
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@ -1028,11 +1028,12 @@ cifs_cancelled_callback(struct mid_q_entry *mid)
+ }
+ 
+ /*
+- * Return a channel (master if none) of @ses that can be used to send
+- * regular requests.
++ * Pick an eligible channel for regular network operations.
+  *
+- * If we are currently binding a new channel (negprot/sess.setup),
+- * return the new incomplete channel.
++ * Prefer the least-loaded established channel. Channels still marked for
++ * reconnect or Session Setup are skipped. If no eligible channel exists,
++ * fall back to the primary channel so the normal reconnect path can wait
++ * for recovery.
+  */
+ struct TCP_Server_Info *cifs_pick_channel(struct cifs_ses *ses)
+ {
+@@ -1044,39 +1045,46 @@ struct TCP_Server_Info *cifs_pick_channel(struct cifs_ses *ses)
+ 	if (!ses)
+ 		return NULL;
+ 
++	/*
++	 * Negotiate/Session Setup use cifs_ses_server() explicitly. Regular I/O
++	 * must stay on an established channel while another channel is binding.
++	 */
+ 	spin_lock(&ses->chan_lock);
+-	if (!ses->binding) {
+-		if (ses->chan_count > 1) {
+-			start = atomic_inc_return(&ses->chan_seq);
+-			for (i = 0; i < ses->chan_count; i++) {
+-				cur = (start + i) % ses->chan_count;
+-				server = ses->chans[cur].server;
+-				if (!server)
+-					continue;
+-
+-				if (server->tcpStatus == CifsNeedReconnect)
+-					continue;
+-
+-				/*
+-				 * strictly speaking, we should pick up req_lock to read
+-				 * server->in_flight. But it shouldn't matter much here if we
+-				 * race while reading this data. The worst that can happen is
+-				 * that we could use a channel that's not least loaded. Avoiding
+-				 * taking the lock could help reduce wait time, which is
+-				 * important for this function
+-				 */
+-				if (server->in_flight < min_in_flight) {
+-					min_in_flight = server->in_flight;
+-					index = cur;
+-				}
+-			}
++	start = atomic_inc_return(&ses->chan_seq);
++	for (i = 0; i < ses->chan_count; i++) {
++		cur = (start + i) % ses->chan_count;
++		server = ses->chans[cur].server;
++		if (!server)
++			continue;
++
++		/*
++		 * The reconnect bit stays set from transport failure until Session
++		 * Setup/binding succeeds. Do not re-admit a channel merely because
++		 * its socket has already left CifsNeedReconnect.
++		 */
++		if (CIFS_CHAN_NEEDS_RECONNECT(ses, cur) ||
++		    CIFS_CHAN_IN_RECONNECT(ses, cur))
++			continue;
++
++		/* Preserve the R3.2 transport-state fence as a second guard. */
++		if (server->tcpStatus == CifsNeedReconnect)
++			continue;
++
++		/*
++		 * Preserve the validated R3.1 rotated least-loaded policy. If no
++		 * eligible channel exists, index remains zero and we deliberately
++		 * fall back to the primary transport so normal reconnect handling
++		 * can wait/recover instead of failing channel selection outright.
++		 */
++		if (server->in_flight < min_in_flight) {
++			min_in_flight = server->in_flight;
++			index = cur;
+ 		}
+-		spin_unlock(&ses->chan_lock);
+-		return ses->chans[index].server;
+-	} else {
+-		spin_unlock(&ses->chan_lock);
+-		return cifs_ses_server(ses);
+ 	}
++	server = ses->chans[index].server;
++	spin_unlock(&ses->chan_lock);
++
++	return server;
+ }
+ 
+ int
