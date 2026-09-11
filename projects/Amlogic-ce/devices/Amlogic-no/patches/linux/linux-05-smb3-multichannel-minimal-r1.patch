@@ -1,0 +1,22 @@
+From: CoreELEC Xiaomi SMB3 Multichannel laboratory
+Subject: [EXPERIMENTAL MINIMAL-R1] cifs: try multichannel on non-DFS mount
+
+Diagnostic-only patch.
+Baseline R18 proves cifs_try_adding_channels() is not called when
+CONFIG_CIFS_DFS_UPCALL=n. This variant mirrors the existing DFS-path
+call in the non-DFS cifs_mount() path to prove causality.
+
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -3614,6 +3614,11 @@
+ 			goto error;
+ 	}
+ 
++	/*
++	 * SMB3 multichannel is independent of DFS. Keep the non-DFS mount
++	 * path equivalent to the DFS path for this controlled experiment.
++	 */
++	cifs_try_adding_channels(cifs_sb, mnt_ctx.ses);
+ 	rc = mount_setup_tlink(cifs_sb, mnt_ctx.ses, mnt_ctx.tcon);
+ 	if (rc)
+ 		goto error;

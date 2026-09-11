@@ -1,0 +1,38 @@
+From: CoreELEC Xiaomi SMB3 Multichannel laboratory
+Subject: [EXPERIMENTAL MINIMAL-R2] cifs: backport final secondary-channel hostname handling
+
+Runtime evidence R19 v7 showed every secondary cifs_get_tcp_session()
+attempt returning ERR_PTR(-ENOMEM) before socket creation.
+
+This backport reproduces the final upstream behavior obtained after:
+  5112d80c162f456b3956dd4f5c58e9f0c6498516 cifs: populate server_hostname for extra channels
+  4c14d7043fede258957d7b01da0cad2d9fe3a205 cifs: populate empty hostnames for extra channels
+
+The final state uses an allocated empty hostname for secondary channels
+and skips hostname DNS refresh for that empty value during reconnect.
+
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -223,6 +223,9 @@
+ 	/* Auth */
+ 	ctx.domainauto = ses->domainAuto;
+ 	ctx.domainname = ses->domainName;
++
++	/* no hostname for extra channels */
++	ctx.server_hostname = "";
+ 	ctx.username = ses->user_name;
+ 	ctx.password = ses->password;
+ 	ctx.sectype = ses->sectype;
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -97,6 +97,10 @@
+ 	if (!server->hostname)
+ 		return -EINVAL;
+ 
++	/* if server hostname isn't populated, there's nothing to do here */
++	if (server->hostname[0] == '\0')
++		return 0;
++
+ 	len = strlen(server->hostname) + 3;
+ 
+ 	unc = kmalloc(len, GFP_KERNEL);
