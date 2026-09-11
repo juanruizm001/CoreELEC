@@ -1,0 +1,44 @@
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -2904,7 +2904,8 @@
+ 	unsigned int wsize;
+ 	struct cifs_credits credits;
+ 	int rc;
+-	struct TCP_Server_Info *server = wdata->server;
++	struct TCP_Server_Info *server;
++	struct cifs_tcon *tcon = tlink_tcon(wdata->cfile->tlink);
+ 
+ 	do {
+ 		if (wdata->cfile->invalidHandle) {
+@@ -2915,6 +2916,18 @@
+ 				break;
+ 		}
+ 
++
++		/*
++		 * A retry may have been applied before the response was lost.
++		 * Repick a healthy channel, then mark the SMB3 WRITE as replay.
++		 */
++		server = cifs_pick_channel(tcon->ses);
++		if (!server) {
++			rc = -EIO;
++			goto fail;
++		}
++		wdata->server = server;
++		wdata->replay = true;
+ 
+ 		/*
+ 		 * Wait for credits to resend this wdata.
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -4475,6 +4475,8 @@
+ 		flags |= CIFS_TRANSFORM_REQ;
+ 
+ 	shdr = (struct smb2_sync_hdr *)req;
++	if (wdata->replay && server && server->dialect >= SMB30_PROT_ID)
++		shdr->Flags |= SMB2_FLAGS_REPLAY_OPERATION;
+ 	shdr->ProcessId = cpu_to_le32(wdata->cfile->pid);
+ 
+ 	req->PersistentFileId = wdata->cfile->fid.persistent_fid;
