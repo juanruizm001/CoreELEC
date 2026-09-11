@@ -1,0 +1,186 @@
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -2973,7 +2973,7 @@
+ 
+ 		/* Roll back credits and retry if needed */
+ 		add_credits_and_wake_if(server, &wdata->credits, 0);
+-	} while (rc == -EAGAIN);
++	} while (is_replayable_error(rc));
+ 
+ fail:
+ 	kref_put(&wdata->refcount, cifs_uncached_writedata_release);
+@@ -2994,6 +2994,7 @@
+ 	loff_t saved_offset = offset;
+ 	pid_t pid;
+ 	struct TCP_Server_Info *server;
++	bool replay = false;
+ 	struct page **pagevec;
+ 	size_t start;
+ 	unsigned int xid;
+@@ -3003,7 +3004,6 @@
+ 	else
+ 		pid = current->tgid;
+ 
+-	server = cifs_pick_channel(tlink_tcon(open_file->tlink)->ses);
+ 	xid = get_xid();
+ 
+ 	do {
+@@ -3019,10 +3019,23 @@
+ 				break;
+ 		}
+ 
++		/* Every attempt chooses a currently eligible channel before taking
++		 * credits; the same server then owns credits and the async send. */
++		server = cifs_pick_channel(tlink_tcon(open_file->tlink)->ses);
++		if (!server) {
++			rc = -EIO;
++			break;
++		}
++
+ 		rc = server->ops->wait_mtu_credits(server, cifs_sb->ctx->wsize,
+ 						   &wsize, credits);
+-		if (rc)
++		if (rc) {
++			/* No request was sent yet: just repick on a replayable
++			 * transport failure; do not mark a new WRITE as replay. */
++			if (is_replayable_error(rc))
++				continue;
+ 			break;
++		}
+ 
+ 		cur_len = min_t(const size_t, len, wsize);
+ 
+@@ -3108,6 +3121,7 @@
+ 		wdata->offset = (__u64)offset;
+ 		wdata->cfile = cifsFileInfo_get(open_file);
+ 		wdata->server = server;
++		wdata->replay = replay;
+ 		wdata->pid = pid;
+ 		wdata->bytes = cur_len;
+ 		wdata->pagesz = PAGE_SIZE;
+@@ -3129,7 +3143,9 @@
+ 			add_credits_and_wake_if(server, &wdata->credits, 0);
+ 			kref_put(&wdata->refcount,
+ 				 cifs_uncached_writedata_release);
+-			if (rc == -EAGAIN) {
++			if (is_replayable_error(rc)) {
++				/* Retry the same offset/data on another channel. */
++				replay = true;
+ 				*from = saved_from;
+ 				iov_iter_advance(from, offset - saved_offset);
+ 				continue;
+@@ -3137,6 +3153,8 @@
+ 			break;
+ 		}
+ 
++		/* The next chunk is a new WRITE, not a replay of this one. */
++		replay = false;
+ 		list_add_tail(&wdata->list, wdata_list);
+ 		offset += cur_len;
+ 		len -= cur_len;
+@@ -3184,7 +3202,7 @@
+ 				ctx->total_len += wdata->bytes;
+ 
+ 			/* resend call if it's a retryable error */
+-			if (rc == -EAGAIN) {
++			if (is_replayable_error(rc)) {
+ 				struct list_head tmp_list;
+ 				struct iov_iter tmp_from = ctx->iter;
+ 
+diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -1885,12 +1885,20 @@
+ 	struct TCP_Server_Info *server;
+ 	unsigned int rest_len;
+ 
+-	server = tlink_tcon(wdata->cfile->tlink)->ses->server;
+ 	i = 0;
+ 	rest_len = wdata->bytes;
+ 	do {
+ 		struct cifs_writedata *wdata2;
++		struct cifs_tcon *tcon = tlink_tcon(wdata->cfile->tlink);
+ 		unsigned int j, nr_pages, wsize, tailsz, cur_len;
++
++		/* Retry writeback on a healthy channel. Bind it before sizing/sending
++		 * so a single transport owns the complete retry attempt. */
++		server = cifs_pick_channel(tcon->ses);
++		if (!server) {
++			rc = -EIO;
++			break;
++		}
+ 
+ 		wsize = server->ops->wp_retry_size(inode);
+ 		if (wsize < rest_len) {
+@@ -1920,6 +1928,8 @@
+ 		}
+ 
+ 		wdata2->sync_mode = wdata->sync_mode;
++		wdata2->server = server;
++		wdata2->replay = true;
+ 		wdata2->nr_pages = nr_pages;
+ 		wdata2->offset = page_offset(wdata2->pages[0]);
+ 		wdata2->pagesz = PAGE_SIZE;
+@@ -1931,7 +1941,7 @@
+ 		if (!wdata2->cfile) {
+ 			cifs_dbg(VFS, "No writable handle to retry writepages rc=%d\n",
+ 				 rc);
+-			if (!is_retryable_error(rc))
++			if (!is_retryable_error(rc) && !is_replayable_error(rc))
+ 				rc = -EBADF;
+ 		} else {
+ 			wdata2->pid = wdata2->cfile->pid;
+@@ -1941,7 +1951,8 @@
+ 
+ 		for (j = 0; j < nr_pages; j++) {
+ 			unlock_page(wdata2->pages[j]);
+-			if (rc != 0 && !is_retryable_error(rc)) {
++			if (rc != 0 && !is_retryable_error(rc) &&
++			    !is_replayable_error(rc)) {
+ 				SetPageError(wdata2->pages[j]);
+ 				end_page_writeback(wdata2->pages[j]);
+ 				put_page(wdata2->pages[j]);
+@@ -1950,7 +1961,7 @@
+ 
+ 		kref_put(&wdata2->refcount, cifs_writedata_release);
+ 		if (rc) {
+-			if (is_retryable_error(rc))
++			if (is_retryable_error(rc) || is_replayable_error(rc))
+ 				continue;
+ 			i += nr_pages;
+ 			break;
+@@ -1967,7 +1978,7 @@
+ 		put_page(wdata->pages[i]);
+ 	}
+ 
+-	if (rc != 0 && !is_retryable_error(rc))
++	if (rc != 0 && !is_retryable_error(rc) && !is_replayable_error(rc))
+ 		mapping_set_error(inode->i_mapping, rc);
+ 	kref_put(&wdata->refcount, cifs_writedata_release);
+ }
+@@ -1986,12 +1997,13 @@
+ 		spin_unlock(&inode->i_lock);
+ 		cifs_stats_bytes_written(tlink_tcon(wdata->cfile->tlink),
+ 					 wdata->bytes);
+-	} else if (wdata->sync_mode == WB_SYNC_ALL && wdata->result == -EAGAIN)
++	} else if (wdata->sync_mode == WB_SYNC_ALL &&
++		   is_replayable_error(wdata->result))
+ 		return cifs_writev_requeue(wdata);
+ 
+ 	for (i = 0; i < wdata->nr_pages; i++) {
+ 		struct page *page = wdata->pages[i];
+-		if (wdata->result == -EAGAIN)
++		if (is_replayable_error(wdata->result))
+ 			__set_page_dirty_nobuffers(page);
+ 		else if (wdata->result < 0)
+ 			SetPageError(page);
+@@ -1999,7 +2011,7 @@
+ 		cifs_readpage_to_fscache(inode, page);
+ 		put_page(page);
+ 	}
+-	if (wdata->result != -EAGAIN)
++	if (!is_replayable_error(wdata->result))
+ 		mapping_set_error(inode->i_mapping, wdata->result);
+ 	kref_put(&wdata->refcount, cifs_writedata_release);
+ }
